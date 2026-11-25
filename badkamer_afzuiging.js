@@ -7,6 +7,11 @@
 //    PATCH = bugfix of alleen instellingen aangepast
 //
 //  Wijzigingslog:
+//    1.3.0  2026-11-25  Tweede vochtsensor in de badkamer (radiatorknop).
+//                       Aan op de snelste stijging, vangnet/uit/voortgang
+//                       op de LAAGSTE waarde: één natte sensor
+//                       vlak bij de douche houdt de afzuiging niet meer
+//                       voor de gek. Sensor pas 'verouderd' na 3 uur.
 //    1.2.0  2026-11-24  Na 2 uur doordraaien zolang het nog daalt
 //                       (≥2% per 30 min); absolute stop na 6 uur.
 //    1.1.0  2026-11-22  Handmatig aanzetten respecteren, stijging over
@@ -15,10 +20,11 @@
 //    1.0.0  -           Originele versie.
 // =====================================================================
 
-const VERSIE = '1.2.0';
+const VERSIE = '1.3.0';
 
 // --- CONFIGURATIE ---
 const NAAM_BADKAMER   = 'Thermometer Badkamer';
+const NAAM_BADKAMER_2 = 'Badkamer - Slimme Radiatorknop'; // tweede vochtsensor ('' = niet gebruiken)
 const NAAM_REFERENTIE = 'Thermometer Slaapkamer';
 const NAAM_VENTILATOR = 'Afzuiging badkamer';
 const NAAM_BEHEERDER  = 'Jouw Naam';   // jouw gebruikersnaam in Homey (krijgt de pushberichten)
@@ -40,7 +46,7 @@ const CRITICAL_GRENS     = 90;  // %
 const CRITICAL_NA_MIN    = 45;  // alleen alarm als hij al zo lang draait (of niet draait)
 const CRITICAL_HERHAAL_MIN = 30;
 
-const SENSOR_MAX_OUD_MIN = 60;  // sensorwaarde ouder dan dit = niet vertrouwen
+const SENSOR_MAX_OUD_MIN = 180; // sensorwaarde ouder dan dit = niet vertrouwen
 
 console.log(`--- Start Script: Badkamer Afzuiging v${VERSIE} ---`);
 
@@ -56,6 +62,7 @@ const devices = Object.values(await Homey.devices.getDevices());
 const users   = Object.values(await Homey.users.getUsers());
 
 const badkamer   = devices.find(d => d.name === NAAM_BADKAMER);
+const badkamer2  = NAAM_BADKAMER_2 ? devices.find(d => d.name === NAAM_BADKAMER_2) : null;
 const referentie = devices.find(d => d.name === NAAM_REFERENTIE);
 const ventilator = devices.find(d => d.name === NAAM_VENTILATOR);
 const beheerder  = users.find(u => u.name === NAAM_BEHEERDER);
@@ -103,12 +110,12 @@ const wisStatus = () => {
   global.set('BadVoortgang', null);
 };
 
-const stopOpMax = async (reden, humBad) => {
+const stopOpMax = async (reden, humLaag) => {
   if (await zetVentilator(false)) {
     wisStatus();
     global.set('VentilatorMaxStop', Date.now());
-    await stuurTijdlijn(`🛑 Afzuiging uit: ${reden} (nog ${humBad}%).`);
-    await stuurPush(`De afzuiging is uitgezet: ${reden}. Badkamer nog ${humBad}%.`);
+    await stuurTijdlijn(`🛑 Afzuiging uit: ${reden} (nog ${humLaag}%).`);
+    await stuurPush(`De afzuiging is uitgezet: ${reden}. Badkamer nog ${humLaag}%.`);
     return true;
   }
   return false;
@@ -120,39 +127,58 @@ if (!badkamer || !referentie || !ventilator) {
   return false;
 }
 
-const capBad = badkamer.capabilitiesObj?.measure_humidity;
-const humBad = capBad?.value;
 const humRef = referentie.capabilitiesObj?.measure_humidity?.value;
 const isAan  = ventilator.capabilitiesObj?.onoff?.value === true;
+const nu     = Date.now();
 
-if (typeof humBad !== 'number' || typeof humRef !== 'number') {
+if (NAAM_BADKAMER_2 && !badkamer2) {
+  console.log(`⚠️ Tweede sensor '${NAAM_BADKAMER_2}' niet gevonden, ik gebruik alleen '${NAAM_BADKAMER}'.`);
+}
+
+// Per badkamersensor: waarde, actualiteit en stijging over het venster
+const sensoren = [badkamer, badkamer2].filter(Boolean).map((dev, i) => {
+  const cap = dev.capabilitiesObj?.measure_humidity;
+  const waarde = cap?.value;
+  const leeftijdMin = cap?.lastUpdated ? (nu - new Date(cap.lastUpdated).getTime()) / 60000 : 0;
+  const sleutel = i === 0 ? 'BadHistorie' : `BadHistorie${i + 1}`;
+
+  let stijging = 0;
+  if (typeof waarde === 'number') {
+    let historie = [];
+    try { historie = JSON.parse(global.get(sleutel) || '[]'); } catch (e) { historie = []; }
+    historie = historie.filter(p => nu - p.t <= STIJG_VENSTER_MIN * 60000);
+    const laagste = historie.length ? Math.min(...historie.map(p => p.v)) : waarde;
+    stijging = waarde - laagste;
+    historie.push({ t: nu, v: waarde });
+    global.set(sleutel, JSON.stringify(historie));
+  }
+  return { naam: dev.name, waarde, leeftijdMin, oud: leeftijdMin > SENSOR_MAX_OUD_MIN, stijging };
+});
+
+const metWaarde = sensoren.filter(s => typeof s.waarde === 'number');
+const actueel   = metWaarde.filter(s => !s.oud);
+
+if (!metWaarde.length || typeof humRef !== 'number') {
   await stuurTijdlijn(`⚠️ Badkamer Script v${VERSIE}: sensoren geven geen waarde.`);
   return false;
 }
 
-const nu = Date.now();
-
-// Sensor nog actueel? (lege batterij = waarde blijft hangen)
-const sensorLeeftijdMin = capBad.lastUpdated
-  ? (nu - new Date(capBad.lastUpdated).getTime()) / 60000
-  : 0;
-const sensorOud = sensorLeeftijdMin > SENSOR_MAX_OUD_MIN;
-if (sensorOud) {
-  const gemeld = global.get('BadSensorOudGemeld');
+// Verouderde sensor melden (max. 1x per 6 uur per sensor)
+for (const s of metWaarde.filter(s => s.oud)) {
+  const sleutel = `SensorOudGemeld_${s.naam}`;
+  const gemeld = global.get(sleutel);
   if (!gemeld || nu - gemeld > 6 * 3600000) {
-    await stuurTijdlijn(`⚠️ ${NAAM_BADKAMER} heeft al ${Math.round(sensorLeeftijdMin)} min geen nieuwe waarde gestuurd.`);
-    global.set('BadSensorOudGemeld', nu);
+    await stuurTijdlijn(`⚠️ ${s.naam} heeft al ${Math.round(s.leeftijdMin)} min geen nieuwe waarde gestuurd.`);
+    global.set(sleutel, nu);
   }
 }
 
-// --- 3. Stijging bepalen over een venster (robuust bij onregelmatige sensor-updates) ---
-let historie = [];
-try { historie = JSON.parse(global.get('BadHistorie') || '[]'); } catch (e) { historie = []; }
-historie = historie.filter(p => nu - p.t <= STIJG_VENSTER_MIN * 60000);
-const laagsteRecent = historie.length ? Math.min(...historie.map(p => p.v)) : humBad;
-const stijging = humBad - laagsteRecent;
-historie.push({ t: nu, v: humBad });
-global.set('BadHistorie', JSON.stringify(historie));
+// Bij voorkeur actuele sensoren; zijn die er niet, dan de laatst bekende waarden
+const basis    = actueel.length ? actueel : metWaarde;
+const humHoog  = Math.max(...basis.map(s => s.waarde));   // voor aanzetten
+const humLaag  = Math.min(...basis.map(s => s.waarde));   // voor uitzetten/voortgang/alarm
+const stijging = actueel.length ? Math.max(...actueel.map(s => s.stijging)) : 0;
+const sensorOud = actueel.length === 0;
 
 // --- 4. Status synchroniseren met de werkelijkheid ---
 const ruweStart = global.get('VentilatorStartTijd');
@@ -175,16 +201,21 @@ if (isAan && !startTijd) {
   console.log('✋ Handmatig aanzetten gedetecteerd.');
 }
 
-console.log(`📊 Bad ${humBad}% (stijging ${stijging.toFixed(1)}% / ${STIJG_VENSTER_MIN} min) | Ref ${humRef}% | Ventilator ${isAan ? 'AAN' : 'UIT'}${handmatig ? ' (handmatig)' : ''}`);
+for (const s of sensoren) {
+  console.log(`📊 ${s.naam}: ${s.waarde}% (stijging ${s.stijging.toFixed(1)}% / ${STIJG_VENSTER_MIN} min)${s.oud ? ' [VEROUDERD]' : ''}`);
+}
+console.log(`📊 Hoog ${humHoog}% | Laag ${humLaag}% | Ref ${humRef}% | Ventilator ${isAan ? 'AAN' : 'UIT'}${handmatig ? ' (handmatig)' : ''}`);
 
 // --- 5. AANZETTEN ---
 const laatsteMaxStop = global.get('VentilatorMaxStop');
 const inCooldown = laatsteMaxStop && (nu - laatsteMaxStop) < COOLDOWN_NA_MAX_MIN * 60000;
 
 const snelleStijging = stijging >= DREMPEL_STIJGING;
-const veelTeVochtig  = !inCooldown && humBad >= humRef + DREMPEL_VERSCHIL;
+// Vangnet op de LAAGSTE waarde: alle sensoren moeten het eens zijn, anders houdt
+// één natte sensor de afzuiging aan/uit aan het pendelen
+const veelTeVochtig  = !inCooldown && humLaag >= humRef + DREMPEL_VERSCHIL;
 
-if (!isAan && !sensorOud && humBad > humRef && (snelleStijging || veelTeVochtig)) {
+if (!isAan && !sensorOud && humHoog > humRef && (snelleStijging || veelTeVochtig)) {
   console.log(`🚀 Douche gedetecteerd (${snelleStijging ? 'stijging' : 'verschil'}). Afzuiging AAN.`);
   if (await zetVentilator(true)) {
     aanNu = true;
@@ -192,8 +223,8 @@ if (!isAan && !sensorOud && humBad > humRef && (snelleStijging || veelTeVochtig)
     handmatig = false;
     global.set('VentilatorStartTijd', nu);
     global.set('VentilatorHandmatig', false);
-    await stuurTijdlijn(`🚿 Douche aan! (${humBad}%)`);
-    await stuurPush(`🚿 De douche is aan. De afzuiging start bij ${humBad}%.`);
+    await stuurTijdlijn(`🚿 Douche aan! (${humHoog}%)`);
+    await stuurPush(`🚿 De douche is aan. De afzuiging start bij ${humHoog}%.`);
   }
 }
 
@@ -208,28 +239,28 @@ else if (isAan && startTijd) {
   let stagnatie = false;
   if (draaiMin >= VOORTGANG_CHECK_MIN) {
     if (!voortgang) {
-      global.set('BadVoortgang', JSON.stringify({ t: nu, v: humBad }));
+      global.set('BadVoortgang', JSON.stringify({ t: nu, v: humLaag }));
     } else if (nu - voortgang.t >= VOORTGANG_INTERVAL_MIN * 60000) {
-      const daling = voortgang.v - humBad;
+      const daling = voortgang.v - humLaag;
       console.log(`📉 Daling laatste ${VOORTGANG_INTERVAL_MIN} min: ${daling.toFixed(1)}%`);
       if (daling < VOORTGANG_MIN_DALING) stagnatie = true;
-      else global.set('BadVoortgang', JSON.stringify({ t: nu, v: humBad }));
+      else global.set('BadVoortgang', JSON.stringify({ t: nu, v: humLaag }));
     }
   }
 
   if (draaiMin >= MAX_DRAAITIJD_MIN) {
     console.log(`⚠️ Absolute maximale draaitijd (${MAX_DRAAITIJD_MIN} min) bereikt.`);
-    if (await stopOpMax(`maximale tijd van ${Math.round(MAX_DRAAITIJD_MIN / 60)} uur bereikt`, humBad)) aanNu = false;
+    if (await stopOpMax(`maximale tijd van ${Math.round(MAX_DRAAITIJD_MIN / 60)} uur bereikt`, humLaag)) aanNu = false;
   } else if (stagnatie) {
     console.log('⚠️ Vochtigheid daalt niet meer. Afzuigen heeft geen zin meer.');
-    if (await stopOpMax(`na ${Math.round(draaiMin)} min daalt de vochtigheid niet meer`, humBad)) aanNu = false;
-  } else if (humBad <= humRef + STOP_MARGE) {
+    if (await stopOpMax(`na ${Math.round(draaiMin)} min daalt de vochtigheid niet meer`, humLaag)) aanNu = false;
+  } else if (humLaag <= humRef + STOP_MARGE) {
     if (draaiMin >= minDraai) {
       console.log('🏁 Lucht weer droog. Afzuiging UIT.');
       if (await zetVentilator(false)) {
         aanNu = false;
         wisStatus();
-        await stuurTijdlijn(`✅ Afzuiging uit (${humBad}%, ${Math.round(draaiMin)} min gedraaid).`);
+        await stuurTijdlijn(`✅ Afzuiging uit (${humLaag}%, ${Math.round(draaiMin)} min gedraaid).`);
       }
     } else {
       console.log(`⏳ Minimale draaitijd: nog ${(minDraai - draaiMin).toFixed(1)} min.`);
@@ -238,7 +269,7 @@ else if (isAan && startTijd) {
 }
 
 // --- 7. KRITIEKE MELDING (alleen als er echt iets mis lijkt) ---
-if (!sensorOud && humBad >= CRITICAL_GRENS) {
+if (!sensorOud && humLaag >= CRITICAL_GRENS) {
   const draaiMin = aanNu && startTijd ? (nu - startTijd) / 60000 : 0;
   if (!aanNu || draaiMin >= CRITICAL_NA_MIN) {
     const laatste = global.get('LaatsteCriticalPush');
@@ -246,8 +277,8 @@ if (!sensorOud && humBad >= CRITICAL_GRENS) {
     if (nu - laatsteMs > CRITICAL_HERHAAL_MIN * 60000) {
       await stuurPush(
         aanNu
-          ? `🚨 Badkamer na ${Math.round(draaiMin)} min afzuigen nog ${humBad}%! Raam open of afzuiging kapot?`
-          : `🚨 Badkamer ${humBad}% en de afzuiging staat UIT!`,
+          ? `🚨 Badkamer na ${Math.round(draaiMin)} min afzuigen nog ${humLaag}%! Raam open of afzuiging kapot?`
+          : `🚨 Badkamer ${humLaag}% en de afzuiging staat UIT!`,
         true
       );
       global.set('LaatsteCriticalPush', nu);
@@ -256,7 +287,6 @@ if (!sensorOud && humBad >= CRITICAL_GRENS) {
 }
 
 // --- 8. Opslaan ---
-global.set('VorigeVochtigheidBad', humBad);
-await tag('Badkamer_Vochtigheid_Nu', humBad);
+await tag('Badkamer_Vochtigheid_Nu', humLaag);
 
 return true;

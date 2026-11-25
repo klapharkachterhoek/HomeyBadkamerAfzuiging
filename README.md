@@ -2,22 +2,24 @@
 
 HomeyScript dat de badkamerafzuiging automatisch aan- en uitzet op basis van de luchtvochtigheid.
 
-**Huidige versie:** 1.2.0, zie het wijzigingslog bovenaan `badkamer_afzuiging.js`.
+**Huidige versie:** 1.3.0, zie het wijzigingslog bovenaan `badkamer_afzuiging.js`.
 
 ## Wat het doet
 
-- **Aan bij douchen:** de vochtigheid stijgt ≥ 4% binnen 5 minuten, of de badkamer is ≥ 12% vochtiger dan de slaapkamer (vangnet).
+- **Twee sensoren in de badkamer (optioneel):** aanzetten gebeurt op de snelste stijging; het vangnet, het uitzetten en de voortgangscontrole gebruiken de **laagste** waarde. Zo houdt één natte sensor vlak bij de douche de afzuiging niet voor de gek. Laat `NAAM_BADKAMER_2` leeg om maar één sensor te gebruiken.
+- **Aan bij douchen:** de vochtigheid stijgt ≥ 4% binnen 5 minuten, of alle badkamersensoren zijn ≥ 12% vochtiger dan de slaapkamer (vangnet).
 - **Uit als het droog is:** vochtigheid ≤ slaapkamer + 3%, na minimaal 10 minuten draaien.
 - **Handmatig aanzetten wordt gerespecteerd:** na een druk op de schakelaar draait de afzuiging minimaal 20 minuten en daarna tot het droog is.
 - **Langer doordraaien zolang het helpt:** na 2 uur blijft de afzuiging alleen draaien als de vochtigheid nog ≥ 2% per 30 minuten daalt. Absolute stop na 6 uur.
 - **Kritieke melding** alleen als de vochtigheid na 45 minuten afzuigen nog ≥ 90% is, of als de afzuiging uit staat.
-- **Waarschuwing bij een verouderde sensor:** de thermometer heeft al een uur geen nieuwe waarde gestuurd, bijvoorbeeld door een lege batterij.
+- **Waarschuwing bij een verouderde sensor:** een sensor heeft al 3 uur geen nieuwe waarde gestuurd, bijvoorbeeld door een lege batterij.
 
 ## Benodigd
 
 | Apparaat in Homey | Rol |
 |---|---|
 | `Thermometer Badkamer` | vochtigheid badkamer |
+| `Badkamer - Slimme Radiatorknop` | tweede vochtsensor badkamer (optioneel) |
 | `Thermometer Slaapkamer` | referentievochtigheid |
 | `Afzuiging badkamer` | stekker/schakelaar van de afzuiging |
 
